@@ -1,6 +1,11 @@
+import webpush from 'web-push';
+
 interface Env {
   JOB_STORE: KVNamespace;
   JOBTECH_API_URL: string;
+  PUSH_PUBLIC_KEY: string;
+  PUSH_PRIVATE_KEY: string;
+  PUSH_EMAIL: string;
 }
 
 interface Job {
@@ -21,9 +26,24 @@ interface Job {
   publication_date: string;
 }
 
+interface PushSubscription {
+  endpoint: string;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+}
+
 export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     try {
+      // Configure web push
+      webpush.setVapidDetails(
+        `mailto:${env.PUSH_EMAIL}`,
+        env.PUSH_PUBLIC_KEY,
+        env.PUSH_PRIVATE_KEY
+      );
+
       // Fetch new jobs from JobTech Dev API
       const response = await fetch(env.JOBTECH_API_URL);
       const jobs: Job[] = await response.json();
@@ -43,7 +63,7 @@ export default {
         );
 
         // Send notifications for new jobs
-        await sendNotifications(newJobs);
+        await sendNotifications(newJobs, env);
 
         // Auto-apply to matching jobs
         await autoApplyToJobs(newJobs);
@@ -54,7 +74,6 @@ export default {
   },
 
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    // Handle API requests from the frontend
     const url = new URL(request.url);
 
     if (url.pathname === '/api/jobs') {
@@ -72,13 +91,61 @@ export default {
       }
     }
 
+    if (url.pathname === '/api/notifications' && request.method === 'POST') {
+      try {
+        const subscription: PushSubscription = await request.json();
+        
+        // Store subscription in KV store
+        const subscriptions = await env.JOB_STORE.get('push_subscriptions', 'json') || [];
+        subscriptions.push(subscription);
+        await env.JOB_STORE.put('push_subscriptions', JSON.stringify(subscriptions));
+
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: 'Failed to store subscription' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     return new Response('Not found', { status: 404 });
   },
 };
 
-async function sendNotifications(jobs: Job[]) {
-  // TODO: Implement push notification logic
-  console.log(`Sending notifications for ${jobs.length} new jobs`);
+async function sendNotifications(jobs: Job[], env: Env) {
+  try {
+    const subscriptions: PushSubscription[] = await env.JOB_STORE.get('push_subscriptions', 'json') || [];
+    
+    for (const subscription of subscriptions) {
+      for (const job of jobs) {
+        try {
+          await webpush.sendNotification(
+            subscription,
+            JSON.stringify({
+              title: `New Job: ${job.headline}`,
+              description: `${job.employer.name} is hiring in ${job.workplace_address.municipality}`,
+              url: job.application_details.url
+            })
+          );
+        } catch (error) {
+          console.error('Error sending notification:', error);
+          // If subscription is invalid, remove it
+          if (error.statusCode === 410) {
+            const currentSubscriptions = await env.JOB_STORE.get('push_subscriptions', 'json') || [];
+            const updatedSubscriptions = currentSubscriptions.filter(
+              (s: PushSubscription) => s.endpoint !== subscription.endpoint
+            );
+            await env.JOB_STORE.put('push_subscriptions', JSON.stringify(updatedSubscriptions));
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error sending notifications:', error);
+  }
 }
 
 async function autoApplyToJobs(jobs: Job[]) {
