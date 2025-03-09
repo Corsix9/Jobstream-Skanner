@@ -1,4 +1,4 @@
-# Jobsteam-Skanner
+# Jobstream-Skanner
 arbetsformedlingen.se skanner för automatisk 
 egen övervakning och functioner
 
